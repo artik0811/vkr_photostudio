@@ -22,3 +22,4 @@ DROP TABLE IF EXISTS bookings;
 DROP TABLE IF EXISTS services;
 DROP TABLE IF EXISTS clients;
 DROP TABLE IF EXISTS photographers;
+DROP TABLE IF EXISTS working_hours; 

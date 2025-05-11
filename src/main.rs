@@ -9,11 +9,11 @@ mod handlers;
 use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
-    types::{CallbackQuery, InlineKeyboardMarkup, MaybeInaccessibleMessage},
+    types::{CallbackQuery, MaybeInaccessibleMessage},
 };
 
 extern crate pretty_env_logger;
-#[macro_use] extern crate log;
+extern crate log;
 
 #[tokio::main]
 async fn main() {
@@ -28,7 +28,6 @@ async fn main() {
     let handler = dptree::entry() 
     .branch(
         Update::filter_message().endpoint({
-        let bot = bot.clone();
         let pool = pool.clone();
         let user_sessions = user_sessions.clone();
 
@@ -44,7 +43,6 @@ async fn main() {
         }
     }))
     .branch(Update::filter_callback_query().endpoint({
-        let bot = bot.clone();
         let pool = pool.clone();
         let user_sessions = user_sessions.clone();
     
@@ -64,6 +62,7 @@ async fn main() {
     }));
 
     Dispatcher::builder(bot, handler)
+        .dependencies(dptree::deps![user_sessions])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

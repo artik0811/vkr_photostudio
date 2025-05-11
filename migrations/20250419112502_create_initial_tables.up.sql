@@ -1,7 +1,8 @@
 -- Add migration script here
 CREATE TABLE photographers (
     id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    telegram_id BIGINT UNIQUE
 );
 
 CREATE TABLE clients (
@@ -38,4 +39,14 @@ CREATE TABLE photographer_services (
     id SERIAL PRIMARY KEY,
     photographer_id INTEGER REFERENCES photographers(id),
     service_id INTEGER REFERENCES services(id)
+);
+
+CREATE TABLE IF NOT EXISTS working_hours (
+    id SERIAL PRIMARY KEY,
+    photographer_id INTEGER REFERENCES photographers(id),
+    date DATE NOT NULL,
+    start_hour INTEGER NOT NULL,
+    end_hour INTEGER NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(photographer_id, date)
 );

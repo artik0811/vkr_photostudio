@@ -38,6 +38,7 @@ pub struct Service {
     pub name: String,
     pub cost: i32,
     pub duration: i32,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
