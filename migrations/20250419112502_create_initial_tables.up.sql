@@ -1,17 +1,19 @@
--- Add migration script here
-CREATE TABLE photographers (
+CREATE TABLE IF NOT EXISTS photographers (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
-    telegram_id BIGINT UNIQUE
+    telegram_id BIGINT UNIQUE,
+    portfolio_url TEXT,
+    description TEXT
 );
 
-CREATE TABLE clients (
+CREATE TABLE IF NOT EXISTS clients (
     id SERIAL PRIMARY KEY,
     telegram_id BIGINT NOT NULL UNIQUE,
-    name TEXT NOT NULL
+    name TEXT NOT NULL,
+    username TEXT
 );
 
-CREATE TABLE services (
+CREATE TABLE IF NOT EXISTS services (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     cost INTEGER NOT NULL,
@@ -19,23 +21,18 @@ CREATE TABLE services (
     comment TEXT NOT NULL
 );
 
-CREATE TABLE bookings (
+CREATE TABLE IF NOT EXISTS bookings (
     id SERIAL PRIMARY KEY,
     client_id INTEGER REFERENCES clients(id),
     photographer_id INTEGER REFERENCES photographers(id),
     service_id INTEGER REFERENCES services(id),
     booking_start TIMESTAMP NOT NULL,
     booking_end TIMESTAMP NOT NULL,
+    description TEXT,
     status TEXT NOT NULL
 );
 
-CREATE TABLE materials (
-    id SERIAL PRIMARY KEY,
-    booking_id INTEGER REFERENCES bookings(id),
-    file_url TEXT NOT NULL
-);
-
-CREATE TABLE photographer_services (
+CREATE TABLE IF NOT EXISTS photographer_services (
     id SERIAL PRIMARY KEY,
     photographer_id INTEGER REFERENCES photographers(id),
     service_id INTEGER REFERENCES services(id)
@@ -50,3 +47,11 @@ CREATE TABLE IF NOT EXISTS working_hours (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(photographer_id, date)
 );
+
+CREATE TABLE IF NOT EXISTS archived_clients (
+    id SERIAL PRIMARY KEY,
+    telegram_id BIGINT NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    username VARCHAR(255),
+    archived_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+); 

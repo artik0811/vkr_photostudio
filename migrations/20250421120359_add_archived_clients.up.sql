@@ -1,7 +1,0 @@
-CREATE TABLE archived_clients (
-    id SERIAL PRIMARY KEY,
-    telegram_id BIGINT NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    username VARCHAR(255),
-    archived_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-); 

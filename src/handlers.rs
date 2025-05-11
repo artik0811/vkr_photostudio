@@ -1,6 +1,6 @@
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Local};
 use log::{error};
-use teloxide::{prelude::*, types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, Message, ReplyMarkup, User, WebAppInfo}, RequestError};
+use teloxide::{prelude::*, types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, Message, ReplyMarkup, User, WebAppInfo, MessageId}, RequestError};
 use sqlx::{postgres::PgQueryResult, query::{self, Map}, PgPool, Row};
 use url::Url;
 use core::slice;
@@ -81,11 +81,13 @@ enum UserStep {
     PhotographerMainMenu,
     ViewSchedule,
     ViewBookings,
-    UploadMaterials,
+    ChangeDescription,
+    ChangePortfolio,
     CustomHours,
     // New steps
     ChangeName,
     PersonalCabinet,
+    SelectTime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,6 +176,19 @@ pub async fn handle_message(msg: Message, bot: Bot, pool: PgPool, user_sessions:
                 session.step = UserStep::ChangeName;
                 bot.send_message(chat_id, "Введите новое имя:").await?;
             },
+            "Личный кабинет" => {
+                session.step = UserStep::PersonalCabinet;
+                let buttons: Vec<Vec<KeyboardButton>> = vec![
+                        vec![KeyboardButton::new("История записей")],
+                        vec![KeyboardButton::new("Изменить имя")],
+                        vec![KeyboardButton::new("Отозвать согласие")],
+                        vec![KeyboardButton::new("⟵ Назад")],
+                    ];
+                    let keyboard = KeyboardMarkup::new(buttons).resize_keyboard();
+                    bot.send_message(chat_id, "Личный кабинет")
+                        .reply_markup(ReplyMarkup::Keyboard(keyboard))
+                        .await?;
+            }
             "Отозвать согласие" => {
                 let keyboard = InlineKeyboardMarkup::new(vec![
                     vec![InlineKeyboardButton::callback("Да, отозвать согласие", "revoke_consent:confirm")],
@@ -264,7 +279,7 @@ pub async fn handle_message(msg: Message, bot: Bot, pool: PgPool, user_sessions:
 
         UserStep::PhotographerMainMenu => {
             if session.user_type != UserType::Photographer {
-                bot.send_message(chat_id, "Эта функция доступна только фотографам")
+                bot.send_message(chat_id, "Неизвестная команда")
                     .await
                     .unwrap();
                 return Ok(());
@@ -277,29 +292,64 @@ pub async fn handle_message(msg: Message, bot: Bot, pool: PgPool, user_sessions:
                 if let Some(photographer_id) = session.photographer_id {
                     show_photographer_bookings(bot.clone(), chat_id, &pool, photographer_id).await?;
                 }
-            } else if text == "Загрузить материалы" {
-                session.step = UserStep::UploadMaterials;
-                bot.send_message(chat_id, "Пожалуйста, отправьте фотографии для записи")
+            } else if text == "Изменить портфолио" {
+                session.step = UserStep::ChangePortfolio;
+                bot.send_message(chat_id, "Пришлите новую ссылку на портфолио в виде \"https://www.google.com/\"")
+                    .await
+                    .unwrap();
+            } else if text == "Изменить свое описание" {
+                session.step = UserStep::ChangeDescription;
+                bot.send_message(chat_id, "Пришлите новое описание одним сообщением")
                     .await
                     .unwrap();
             }
         }
 
-        UserStep::UploadMaterials => {
+        UserStep::ChangePortfolio => {
             if session.user_type != UserType::Photographer {
-                bot.send_message(chat_id, "Эта функция доступна только фотографам")
+                bot.send_message(chat_id, "Неизвестная команда")
                     .await
                     .unwrap();
                 return Ok(());
             }
-            if let Some(photo) = msg.photo() {
-                // Handle photo upload
-                // TODO: Implement photo upload logic
-                bot.send_message(chat_id, "Фотография успешно загружена!")
+            if let Some(text) = msg.text() {
+                sqlx::query!(
+                    "UPDATE photographers SET portfolio_url = $1 WHERE id = $2",
+                    text,
+                    session.photographer_id
+                )
+                .execute(&pool)
+                .await?;
+                bot.send_message(chat_id, "Портфолио обновлено!")
                     .await
                     .unwrap();
             } else {
-                bot.send_message(chat_id, "Пожалуйста, отправьте фотографию")
+                bot.send_message(chat_id, "Пожалуйста, отправьте новую ссылку")
+                    .await
+                    .unwrap();
+            }
+        }
+
+        UserStep::ChangeDescription => {
+            if session.user_type != UserType::Photographer {
+                bot.send_message(chat_id, "Неизвестная команда")
+                    .await
+                    .unwrap();
+                return Ok(());
+            }
+            if let Some(text) = msg.text() {
+                sqlx::query!(
+                    "UPDATE photographers SET description = $1 WHERE id = $2",
+                    text,
+                    session.photographer_id
+                )
+                .execute(&pool)
+                .await?;
+                bot.send_message(chat_id, "Описание обновлено!")
+                    .await
+                    .unwrap();
+            } else {
+                bot.send_message(chat_id, "Пожалуйста, отправьте новое описание")
                     .await
                     .unwrap();
             }
@@ -344,7 +394,7 @@ pub async fn handle_message(msg: Message, bot: Bot, pool: PgPool, user_sessions:
 
         UserStep::HistoryOfBookings => {
             if session.client_id != -1 {
-                show_client_bookings(bot.clone(), chat_id, &pool, session.client_id).await?;
+                show_client_bookings(bot.clone(), chat_id, pool, session.client_id, 0, session, msg).await?;
                 session.step = UserStep::MainMenu;
             } else {
                 bot.send_message(chat_id, "Пожалуйста, сначала зарегистрируйтесь")
@@ -549,6 +599,34 @@ pub async fn handle_message(msg: Message, bot: Bot, pool: PgPool, user_sessions:
                 .reply_markup(ReplyMarkup::Keyboard(keyboard))
                 .await?;
         },
+        UserStep::SelectTime => {
+            if let Some(date_str) = text.split('_').nth(1) {
+                if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                    let today = Date::from_calendar_date(
+                        Local::now().year(),
+                        Month::try_from(Local::now().month() as u8).unwrap(),
+                        Local::now().day() as u8
+                    ).unwrap();
+                    let selected_date = Date::from_calendar_date(
+                        date.year(),
+                        Month::try_from(date.month() as u8).unwrap(),
+                        date.day() as u8
+                    ).unwrap();
+                    
+                    if selected_date < today {
+                        bot.send_message(
+                            chat_id,
+                            "Нельзя выбрать дату в прошлом. Пожалуйста, выберите другую дату.",
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    
+                    session.selected_date = Some(selected_date);
+                    session.step = UserStep::SelectTime;
+                }
+            }
+        },
     }
     Ok(())
 }
@@ -637,6 +715,42 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                             booking.service_name,
                             status
                         ));
+                        let mut booking_buttons = vec![
+                            InlineKeyboardButton::callback(
+                                format!("🔢 #{}", booking.id),
+                                "ignore".to_string()
+                            ),
+                        ];
+                        if let Some(username) = &booking.client_phone {
+                            if !username.is_empty() {
+                                let url = format!("https://t.me/{}", username);
+                                match Url::parse(&url) {
+                                    Ok(parsed_url) => {
+                                        booking_buttons.push(InlineKeyboardButton::url(
+                                            "📞 Связаться".to_string(),
+                                            parsed_url
+                                        ));
+                                    },
+                                    Err(e) => {
+                                        println!("Error parsing URL for username {}: {}", username, e);
+                                    }
+                                }
+                            }
+                        }
+
+
+                        // Добавляем кнопки в зависимости от статуса записи
+                        if booking.status == "confirmed" {
+                            booking_buttons.push(InlineKeyboardButton::callback(
+                                "✅ Завершить".to_string(),
+                                format!("complete_booking:{}", booking.id)
+                            ));
+                            booking_buttons.push(InlineKeyboardButton::callback(
+                                "❌ Отменить".to_string(),
+                                format!("reject_booking:{}", booking.id)
+                            ));
+                        }
+                        keyboard.push(booking_buttons);
                     }
 
                     if bookings.len() > bookings_per_page {
@@ -655,7 +769,6 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                     }
 
                     let keyboard = InlineKeyboardMarkup::new(keyboard);
-                    
                     if let Some(msg) = q.message.clone() {
                         bot.edit_message_text(chat_id, msg.id(), message)
                             .parse_mode(teloxide::types::ParseMode::Markdown)
@@ -710,7 +823,7 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                     let mut keyboard = vec![];
 
                     for booking in page_bookings {
-                        let date_format = format_description!("[day].[month].[year]");
+                        let date_format: &[time::format_description::BorrowedFormatItem<'_>] = format_description!("[day].[month].[year]");
                         let time_format = format_description!("[hour]:[minute]");
                         
                         let date = booking.booking_start.format(&date_format).unwrap();
@@ -735,6 +848,29 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                             booking.service_name,
                             status
                         ));
+                        let mut booking_buttons = vec![
+                            InlineKeyboardButton::callback(
+                                format!("🔢 #{}", booking.id),
+                                "ignore".to_string()
+                            ),
+                        ];
+                        if let Some(username) = &booking.client_phone {
+                            if !username.is_empty() {
+                                let url = format!("https://t.me/{}", username);
+                                match Url::parse(&url) {
+                                    Ok(parsed_url) => {
+                                        booking_buttons.push(InlineKeyboardButton::url(
+                                            "📞 Связаться".to_string(),
+                                            parsed_url
+                                        ));
+                                    },
+                                    Err(e) => {
+                                        println!("Error parsing URL for username {}: {}", username, e);
+                                    }
+                                }
+                            }
+                        }
+                        keyboard.push(booking_buttons);
                     }
 
                     if bookings.len() > bookings_per_page {
@@ -796,215 +932,267 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                 session.step = UserStep::MainMenu;
             },
             _ if data.starts_with("calendar:") => {
-            let parts: Vec<&str> = data.split(':').collect();
-            match parts.as_slice() {
-                    ["calendar", "select", date] => {
-                        let date_format = format_description!("[year]-[month]-[day]");
-                        if let Ok(selected_date) = Date::parse(date, &date_format) {
-                            session.selected_date = Some(selected_date);
-                            
-                            if session.user_type == UserType::Photographer {
-                                // Для фотографов показываем настройку рабочего времени
-                                if let Some((start_hour, end_hour)) = get_working_hours(&pool, session.photographer_id.unwrap(), selected_date).await {
-                                    let message = format!(
-                                        "Текущие рабочие часы на {}: {}:00-{}:00\n\nВыберите новые рабочие часы:",
-                                        selected_date,
-                                        start_hour,
-                                        end_hour
-                                    );
-                                    add_working_day(bot.clone(), chat_id, &pool, session.photographer_id.unwrap(), selected_date).await?;
-                                } else {
-                                    add_working_day(bot.clone(), chat_id, &pool, session.photographer_id.unwrap(), selected_date).await?;
+                let parts: Vec<&str> = data.split(':').collect();
+                match parts.as_slice() {
+                        ["calendar", "select", date] => {
+                            let date_format = format_description!("[year]-[month]-[day]");
+                            if let Ok(selected_date) = Date::parse(date, &date_format) {
+                                let today = Date::from_calendar_date(
+                                    Local::now().year(),
+                                    Month::try_from(Local::now().month() as u8).unwrap(),
+                                    Local::now().day() as u8
+                                ).unwrap();
+                                
+                                if selected_date < today {
+                                    bot.send_message(chat_id, "Нельзя выбрать дату в прошлом. Пожалуйста, выберите другую дату.")
+                                        .await?;
+                                    return Ok(());
                                 }
-                            } else {
-                                // Для клиентов показываем доступные слоты
-                                if let Some(service_id) = session.service_id {
-                                    if let Some(photographer_id) = session.photographer_id {
-                                        // Если выбран конкретный фотограф
-                                        if let Some((start_hour, end_hour)) = get_working_hours(&pool, photographer_id, selected_date).await {
-                                            if start_hour > 0 && end_hour > 0 {
-                                                let date_time = PrimitiveDateTime::new(selected_date, time!(0:00));
-                                                match get_free_slots(&pool, photographer_id, service_id, date_time).await {
-                                                    Ok(slots) => {
-                                                        if slots.is_empty() {
-                                                            bot.send_message(chat_id, "На выбранную дату нет свободных слотов")
+                                
+                                session.selected_date = Some(selected_date);
+                                
+                                if session.user_type == UserType::Photographer {
+                                    // Для фотографов показываем настройку рабочего времени
+                                    if let Some((start_hour, end_hour)) = get_working_hours(&pool, session.photographer_id.unwrap(), selected_date).await {
+                                        let message = format!(
+                                            "Текущие рабочие часы на {}: {}:00-{}:00\n\nВыберите новые рабочие часы:",
+                                            selected_date,
+                                            start_hour,
+                                            end_hour
+                                        );
+                                        add_working_day(bot.clone(), chat_id, &pool, session.photographer_id.unwrap(), selected_date).await?;
+                                    } else {
+                                        add_working_day(bot.clone(), chat_id, &pool, session.photographer_id.unwrap(), selected_date).await?;
+                                    }
+                                } else {
+                                    // Для клиентов показываем доступные слоты
+                                    if let Some(service_id) = session.service_id {
+                                        if let Some(photographer_id) = session.photographer_id {
+                                            // Если выбран конкретный фотограф
+                                            if let Some((start_hour, end_hour)) = get_working_hours(&pool, photographer_id, selected_date).await {
+                                                if start_hour > 0 && end_hour > 0 {
+                                                    let date_time = PrimitiveDateTime::new(selected_date, time!(0:00));
+                                                    match get_free_slots(&pool, photographer_id, service_id, date_time).await {
+                                                        Ok(slots) => {
+                                                            if slots.is_empty() {
+                                                                bot.edit_message_text(chat_id, msg.id, "На выбранную дату нет свободных слотов")
+                                                                    .await?;
+                                                            } else {
+                                                                show_time_slots(bot.clone(), chat_id, slots, msg.id).await?;
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("Ошибка при получении свободных слотов: {}", e);
+                                                            bot.send_message(chat_id, "Произошла ошибка при получении свободных слотов")
                                                                 .await?;
-                                                        } else {
-                                                            show_time_slots(bot.clone(), chat_id, slots).await?;
                                                         }
                                                     }
-                                                    Err(e) => {
-                                                        error!("Ошибка при получении свободных слотов: {}", e);
-                                                        bot.send_message(chat_id, "Произошла ошибка при получении свободных слотов")
-                                                            .await?;
-                                                    }
+                                                } else {
+                                                    bot.send_message(chat_id, "На выбранную дату фотограф не работает. Пожалуйста, выберите другую дату.")
+                                                        .await?;
                                                 }
                                             } else {
                                                 bot.send_message(chat_id, "На выбранную дату фотограф не работает. Пожалуйста, выберите другую дату.")
                                                     .await?;
                                             }
                                         } else {
-                                            bot.send_message(chat_id, "На выбранную дату фотограф не работает. Пожалуйста, выберите другую дату.")
-                                                .await?;
-                                        }
-                                    } else {
-                                        // Если выбран "любой фотограф"
-                                        let date_time = PrimitiveDateTime::new(selected_date, time!(0:00));
-                                        match get_available_photographers(&pool, service_id, date_time).await {
-                                            Ok(slots) => {
-                                                if slots.is_empty() {
-                                                    bot.send_message(chat_id, "На выбранную дату нет свободных слотов")
-                                                        .await?;
-                                                } else {
-                                                    show_time_slots(bot.clone(), chat_id, slots).await?;
+                                            // Если выбран "любой фотограф"
+                                            let date_time = PrimitiveDateTime::new(selected_date, time!(0:00));
+                                            match get_available_photographers(&pool, service_id, date_time).await {
+                                                Ok(slots) => {
+                                                    if slots.is_empty() {
+                                                        bot.edit_message_text(chat_id, msg.id, "На выбранную дату нет свободных слотов")
+                                                            .await?;
+                                                    } else {
+                                                        show_time_slots(bot.clone(), chat_id, slots, msg.id).await?;
+                                                    }
                                                 }
-                                            }
-                                            Err(e) => {
-                                                error!("Ошибка при получении свободных слотов: {}", e);
-                                                bot.send_message(chat_id, "Произошла ошибка при получении свободных слотов")
-                                                    .await?;
+                                                Err(e) => {
+                                                    error!("Ошибка при получении свободных слотов: {}", e);
+                                                    bot.send_message(chat_id, "Произошла ошибка при получении свободных слотов")
+                                                        .await?;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+                        },
+                    ["calendar", "next_month", current_month, current_year] => {
+                        let mut month: u32 = current_month.parse().unwrap();
+                        let mut year: i32 = current_year.parse().unwrap();
+                        if month == 12 {
+                            month = 1;
+                            year += 1;
+                        } else {
+                            month += 1;
                         }
-                    },
-                ["calendar", "next_month", current_month, current_year] => {
-                    let mut month: u32 = current_month.parse().unwrap();
-                    let mut year: i32 = current_year.parse().unwrap();
-                    if month == 12 {
-                        month = 1;
-                        year += 1;
-                    } else {
-                        month += 1;
-                    }
-                        let new_calendar = generate_calendar(month, year, &pool, session.photographer_id.unwrap(), session.user_type).await;
+                            let new_calendar = generate_calendar(month, year, &pool, session.photographer_id.unwrap(), session.user_type).await;
 
-                    if let Some(msg) = q.message.clone() {
-                        bot.edit_message_reply_markup(msg.chat().id, msg.id())
-                            .reply_markup(new_calendar)
-                            .await?;
-                    }
-                    },
-                ["calendar", "prev_month", current_month, current_year] => {
-                    let mut month: u32 = current_month.parse().unwrap();
-                    let mut year: i32 = current_year.parse().unwrap();
-                    if month == 1 {
-                        month = 12;
-                        year -= 1;
-                    } else {
-                        month -= 1;
-                    }
+                        if let Some(msg) = q.message.clone() {
+                            bot.edit_message_reply_markup(msg.chat().id, msg.id())
+                                .reply_markup(new_calendar)
+                                .await?;
+                        }
+                        },
+                    ["calendar", "prev_month", current_month, current_year] => {
+                        let mut month: u32 = current_month.parse().unwrap();
+                        let mut year: i32 = current_year.parse().unwrap();
+                        if month == 1 {
+                            month = 12;
+                            year -= 1;
+                        } else {
+                            month -= 1;
+                        }
 
-                        let new_calendar = generate_calendar(month, year, &pool, session.photographer_id.unwrap(), session.user_type).await;
+                            let new_calendar = generate_calendar(month, year, &pool, session.photographer_id.unwrap(), session.user_type).await;
 
-                    if let Some(msg) = q.message.clone() {
-                        bot.edit_message_reply_markup(msg.chat().id, msg.id())
-                            .reply_markup(new_calendar)
-                            .await?;
-                    }
-                    },
-                _ => {}
-            }
+                        if let Some(msg) = q.message.clone() {
+                            bot.edit_message_reply_markup(msg.chat().id, msg.id())
+                                .reply_markup(new_calendar)
+                                .await?;
+                        }
+                        },
+                    _ => {}
+                }
+            },
+            _ if data.starts_with("photographer_info:") => {
+                let photographer_id = data.split(':').nth(1).unwrap().parse::<i32>().unwrap();
+                let photographer = sqlx::query_as::<_, Photographer>(
+                    "SELECT * FROM photographers WHERE id = $1"
+                )
+                .bind(photographer_id)
+                .fetch_one(&pool)
+                .await?;            
+                let mut message = format!(
+                    "*Информация о фотографе*\n\n\
+                    👤 *Имя:* {}\n\
+                    {}\n\n",
+                    photographer.name,
+                    photographer.description.unwrap_or_else(|| "Нет описания".to_string())
+                );
+
+                let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+                let protfolio = photographer.portfolio_url;
+
+                if protfolio.is_some() {
+                    let portfolio_info = Url::parse(protfolio.unwrap().as_str())?;
+                    keyboard.push(vec![
+                        InlineKeyboardButton::web_app("Посмотреть портфолио", WebAppInfo { url: portfolio_info })
+                    ]);
+                }
+                keyboard.push(vec![InlineKeyboardButton::callback(
+                    "⟵ Назад к фотографам".to_string(),
+                    "back_to_photographers".to_string()
+                )]);
+                let keyboard = InlineKeyboardMarkup::new(keyboard);
+
+                bot.edit_message_text(chat_id, msg.id, message)
+                                    .parse_mode(teloxide::types::ParseMode::Markdown)
+                                    .reply_markup(keyboard)
+                                    .await?;
             },
             _ if data.starts_with("time-") => {
-            println!("Time selected: {}", data);
-                let times = data.split("-").collect::<Vec<&str>>();
-            let format = format_description!("[hour]:[minute]");
-                match times.as_slice() {
-                    ["time", start, end] => {
-                        session.selected_time_start = Some(Time::parse(start, &format).unwrap());
-                        session.selected_time_end = Some(Time::parse(end, &format).unwrap());
+                println!("Time selected: {}", data);
+                    let times = data.split("-").collect::<Vec<&str>>();
+                let format = format_description!("[hour]:[minute]");
+                    match times.as_slice() {
+                        ["time", start, end] => {
+                            session.selected_time_start = Some(Time::parse(start, &format).unwrap());
+                            session.selected_time_end = Some(Time::parse(end, &format).unwrap());
 
-                        let time: String = format!("{}:{:02}-{}:{:02}", 
-                            session.selected_time_start.unwrap().hour(), 
-                            session.selected_time_start.unwrap().minute(), 
-                            session.selected_time_end.unwrap().hour(), 
-                            session.selected_time_end.unwrap().minute()
-                        );
-                        
-                    let service = sqlx::query_as::<_, Service>(
-                        "SELECT * FROM services WHERE id = $1"
-                    )
-                    .bind(session.service_id.unwrap())
-                    .fetch_one(&pool)
-                        .await?;
-
-                        // Если выбран "любой фотограф", находим свободного фотографа
-                        let photographer = if session.photographer_id.is_none() {
-                            let date_time = PrimitiveDateTime::new(session.selected_date.unwrap(), session.selected_time_start.unwrap());
-                            match find_available_photographer(&pool, session.service_id.unwrap(), date_time).await {
-                                Ok(Some(photographer)) => photographer,
-                                Ok(None) => {
-                                    bot.send_message(chat_id, "К сожалению, на выбранное время нет свободных фотографов. Пожалуйста, выберите другое время.").await?;
-                                    return Ok(());
-                                },
-                                Err(e) => {
-                                    error!("Error finding available photographer: {}", e);
-                                    bot.send_message(chat_id, "Произошла ошибка при поиске фотографа. Пожалуйста, попробуйте позже.").await?;
-                                    return Ok(());
-                                }
-                            }
-                        } else {
-                            sqlx::query_as::<_, Photographer>(
-                        "SELECT * FROM photographers WHERE id = $1",
-                    )
-                    .bind(session.photographer_id.unwrap())
-                    .fetch_one(&pool)
-                            .await?
-                        };
-
-                    let confirm_button: Vec<String> = vec!["Подтвердить".to_string(), "Изменить".to_string()];
-                    let confirm_action: Vec<String> = vec!["yes".to_string(), "no".to_string()];
-                        let key: InlineKeyboardMarkup = generate_inline_markup("confirming", confirm_button, confirm_action);
-                        
-                        let order_string = format!(
-                            "*Ваша запись:*\r\n\
-                            *Услуга:* {}\r\n\
-                            *Фотограф:* {}\r\n\
-                            *Дата:* {}\r\n\
-                            *Время:* {}\r\n\
-                            *Адрес:* {}\r\n",
-                                                        service.name,
-                                                        photographer.name,
-                                                        session.selected_date.unwrap(),
-                                                        time,
-                            "Москва, ул. Адмирала, д.4"
-                        );
-                        
-                        bot.send_message(chat_id, order_string).await?;
-                        bot.send_message(chat_id, "Подтвердить запись?")
-                        .reply_markup(ReplyMarkup::InlineKeyboard(key))
+                            let time: String = format!("{}:{:02}-{}:{:02}", 
+                                session.selected_time_start.unwrap().hour(), 
+                                session.selected_time_start.unwrap().minute(), 
+                                session.selected_time_end.unwrap().hour(), 
+                                session.selected_time_end.unwrap().minute()
+                            );
+                            
+                        let service = sqlx::query_as::<_, Service>(
+                            "SELECT * FROM services WHERE id = $1"
+                        )
+                        .bind(session.service_id.unwrap())
+                        .fetch_one(&pool)
                             .await?;
-                },
-                _ => {}
-            }
+
+                            // Если выбран "любой фотограф", находим свободного фотографа
+                            let photographer = if session.photographer_id.is_none() {
+                                let date_time = PrimitiveDateTime::new(session.selected_date.unwrap(), session.selected_time_start.unwrap());
+                                match find_available_photographer(&pool, session.service_id.unwrap(), date_time).await {
+                                    Ok(Some(photographer)) => photographer,
+                                    Ok(None) => {
+                                        if let Some(msg) = q.message.clone() {
+                                            bot.edit_message_text(chat_id, msg.id(), "К сожалению, на выбранное время нет свободных фотографов. Пожалуйста, выберите другое время.").await?;
+                                        }
+                                        return Ok(());
+                                    },
+                                    Err(e) => {
+                                        error!("Error finding available photographer: {}", e);
+                                        if let Some(msg) = q.message.clone() {
+                                            bot.edit_message_text(chat_id, msg.id(), "Произошла ошибка при поиске фотографа. Пожалуйста, попробуйте позже.").await?;
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            } else {
+                                sqlx::query_as::<_, Photographer>(
+                            "SELECT * FROM photographers WHERE id = $1",
+                        )
+                        .bind(session.photographer_id.unwrap())
+                        .fetch_one(&pool)
+                                .await?
+                            };
+
+                        let confirm_button: Vec<String> = vec!["Подтвердить".to_string(), "Изменить".to_string()];
+                        let confirm_action: Vec<String> = vec!["yes".to_string(), "no".to_string()];
+                            let key: InlineKeyboardMarkup = generate_inline_markup("confirming", confirm_button, confirm_action);
+                            
+                            let order_string = format!(
+                                "*Ваша запись:*\r\n\
+                                *Услуга:* {}\r\n\
+                                *Фотограф:* {}\r\n\
+                                *Дата:* {} {} {}\r\n\
+                                *Время:* {}\r\n\
+                                *Стоимость:* {} *рублей*\r\n\
+                                *Адрес:* {}\r\n",
+                                                            service.name,
+                                                            photographer.name,
+                                                            session.selected_date.unwrap().day(), month_name_from_month(session.selected_date.unwrap().month()), session.selected_date.unwrap().year(),
+                                                            time,
+                                                            service.cost,
+                                "Москва, ул. Адмирала, д.4"
+                            );
+                            if let Some(msg) = q.message.clone() {
+                                bot.edit_message_text(chat_id, msg.id(), order_string)
+                                    .parse_mode(teloxide::types::ParseMode::Markdown)
+                                    .reply_markup(key)
+                                    .await?;
+                            }
+                    },
+                    _ => {}
+                }
             },
             _ if data.starts_with("service:") => {
-            let service_id = data.split(':').nth(1).unwrap().parse::<i32>().unwrap();
-            session.service_id = Some(service_id);
-            show_photographers_for_service(bot.clone(), chat_id, &pool, service_id).await;
+                let service_id = data.split(':').nth(1).unwrap().parse::<i32>().unwrap();
+                session.service_id = Some(service_id);
+                show_photographers_for_service(bot.clone(), chat_id, &pool, service_id, msg.clone()).await;
             },
             _ if data.starts_with("photographer:") => {
                 let photographer_id = data.split(':').nth(1).unwrap();
                 if photographer_id == "any" {
-                    // Для "любого фотографа" показываем календарь без привязки к конкретному фотографу
-                    session.photographer_id = None; // Устанавливаем None для "любого фотографа"
-                    let today_month = chrono::Utc::now().month();
-                    let today_year = chrono::Utc::now().year();
-                    let key = generate_calendar(today_month, today_year, &pool, -1, UserType::Client).await;
-                    bot.send_message(chat_id, "Выбери дату:")
-                        .reply_markup(ReplyMarkup::InlineKeyboard(key))
-                        .await?;
+                    session.photographer_id = None;
                 } else {
                     let photographer_id = photographer_id.parse::<i32>().unwrap();
-            session.photographer_id = Some(photographer_id);
-            let today_month = chrono::Utc::now().month();
+                    session.photographer_id = Some(photographer_id);
+                }
+                
+                if let Some(msg) = q.message.clone() {
+                    let today_month = chrono::Utc::now().month();
                     let today_year = chrono::Utc::now().year();
-                    let key = generate_calendar(today_month, today_year, &pool, photographer_id, UserType::Client).await;
-            bot.send_message(chat_id, "Выбери дату:")
-                    .reply_markup(ReplyMarkup::InlineKeyboard(key))
+                    let key = generate_calendar(today_month, today_year, &pool, session.photographer_id.unwrap_or(-1), UserType::Client).await;
+                    
+                    bot.edit_message_text(chat_id, msg.id(), "Выбери дату:")
+                        .reply_markup(key)
                         .await?;
                 }
             },
@@ -1041,7 +1229,8 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                     booking_end
                 ).await {
                     Ok(_) => {
-                        bot.send_message(chat_id, "Запись оформлена! Ожидайте подтверждения фотографа.").await?;
+                        bot.edit_message_text(chat_id, msg.id, "Запись оформлена! Ожидайте подтверждения фотографа.")
+                        .await?;
                     }
                     Err(e) => {
                         error!("Error creating booking: {}", e);
@@ -1128,6 +1317,39 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                     bot.send_message(chat_id, "✅ Запись подтверждена").await?;
                 }
             },
+            _ if data.starts_with("client_reject_booking:") => {
+                let booking_id = data.split(':').nth(1).unwrap().parse::<i32>().unwrap();
+                
+                sqlx::query!(
+                    "UPDATE bookings SET status = 'cancelled' WHERE id = $1",
+                    booking_id
+                )
+                .execute(&pool)
+                .await?;
+
+                // Уведомляем фотографа
+                if let Some(booking) = sqlx::query!(
+                    "SELECT photographer_id, id FROM bookings WHERE id = $1",
+                    booking_id
+                )
+                .fetch_optional(&pool)
+                .await? {
+                    if let Some(photographer) = sqlx::query!(
+                        "SELECT telegram_id FROM photographers WHERE id = $1",
+                        booking.photographer_id
+                    )
+                    .fetch_optional(&pool)
+                    .await? {
+                        let text = format!("К сожалению, клиент отменил запись №{} к вам 😔", booking.id);
+                        bot.send_message(ChatId(photographer.telegram_id.unwrap()), text).await?;
+                    }
+                }
+
+                if let Some(msg) = q.message.clone() {
+                    let text = format!("❌ Запись №{} отменена", booking_id);
+                    bot.send_message(chat_id, text).await?;
+                }
+            },
             _ if data.starts_with("reject_booking:") => {
                 let booking_id = data.split(':').nth(1).unwrap().parse::<i32>().unwrap();
                 
@@ -1156,7 +1378,8 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                 }
 
                 if let Some(msg) = q.message.clone() {
-                    bot.send_message(chat_id, "❌ Запись отменена").await?;
+                    let text = format!("❌ Запись №{} отменена", booking_id);
+                    bot.send_message(chat_id, text).await?;
                 }
             },
             _ if data.starts_with("page_upcoming:") => {
@@ -1258,87 +1481,7 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
             },
             _ if data.starts_with("client_bookings:") => {
                 let page = data.split(':').nth(1).unwrap().parse::<usize>().unwrap();
-                let bookings = sqlx::query!(
-                    r#"
-                    SELECT b.*, p.name as photographer_name, s.name as service_name
-                    FROM bookings b
-                    JOIN photographers p ON b.photographer_id = p.id
-                    JOIN services s ON b.service_id = s.id
-                    WHERE b.client_id = $1
-                    ORDER BY b.booking_start DESC
-                    "#,
-                    session.client_id
-                )
-                .fetch_all(&pool)
-                .await?;
-
-                if bookings.is_empty() {
-                    bot.send_message(chat_id, "У вас пока нет записей")
-                        .await?;
-                    return Ok(());
-                }
-
-                let bookings_per_page = 3;
-                let total_pages = (bookings.len() + bookings_per_page - 1) / bookings_per_page;
-
-                let start_idx = page * bookings_per_page;
-                let end_idx = std::cmp::min(start_idx + bookings_per_page, bookings.len());
-                let page_bookings = &bookings[start_idx..end_idx];
-
-                let mut message = String::from("📋 История ваших записей:\n\n");
-                let mut keyboard = vec![];
-
-                for booking in page_bookings {
-                    let date_format = format_description!("[day].[month].[year]");
-                    let time_format = format_description!("[hour]:[minute]");
-                    
-                    let date = booking.booking_start.format(&date_format).unwrap();
-                    let start_time = booking.booking_start.format(&time_format).unwrap();
-                    let end_time = booking.booking_end.format(&time_format).unwrap();
-                    
-                    let status = match booking.status.as_str() {
-                        "new" => "🆕 Новый",
-                        "confirmed" => "✅ Подтвержден",
-                        "completed" => "✅ Выполнен",
-                        "cancelled" => "❌ Отменен",
-                        _ => booking.status.as_str()
-                    };
-                    
-                    message.push_str(&format!(
-                        "*Номер записи: {}*\n*Дата:* {}\n*Время:* {} - {}\n*Фотограф: *{}\n*Услуга:* {}\n*Статус:* {}\n\n",
-                        booking.id,
-                        date,
-                        start_time,
-                        end_time,
-                        booking.photographer_name,
-                        booking.service_name,
-                        status
-                    ));
-                }
-
-                // Add navigation buttons
-                let mut nav_buttons = vec![];
-                if page > 0 {
-                    nav_buttons.push(InlineKeyboardButton::callback("⬅️ Назад", format!("client_bookings:{}", page - 1)));
-                }
-                nav_buttons.push(InlineKeyboardButton::callback(
-                    format!("📄 {}/{}", page + 1, total_pages),
-                    "ignore".to_string(),
-                ));
-                if page < total_pages - 1 {
-                    nav_buttons.push(InlineKeyboardButton::callback("Вперед ➡️", format!("client_bookings:{}", page + 1)));
-                }
-                keyboard.push(nav_buttons);
-
-                let keyboard = InlineKeyboardMarkup::new(keyboard);
-
-                // Update the existing message
-                if let Some(msg) = q.message.clone() {
-                    bot.edit_message_text(chat_id, msg.id(), message)
-                        .parse_mode(teloxide::types::ParseMode::Markdown)
-                        .reply_markup(keyboard)
-                        .await?;
-                }
+                show_client_bookings(bot.clone(), chat_id, pool, session.client_id, page, session, msg).await?;
             },
             _ if data.starts_with("all_bookings:") => {
                 let page = data.split(':').nth(1).unwrap().parse::<usize>().unwrap();
@@ -1410,6 +1553,29 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                             booking.service_name,
                             status
                         ));
+                        let mut booking_buttons = vec![
+                            InlineKeyboardButton::callback(
+                                format!("🔢 #{}", booking.id),
+                                "ignore".to_string()
+                            ),
+                        ];
+                        if let Some(username) = &booking.client_phone {
+                            if !username.is_empty() {
+                                let url = format!("https://t.me/{}", username);
+                                match Url::parse(&url) {
+                                    Ok(parsed_url) => {
+                                        booking_buttons.push(InlineKeyboardButton::url(
+                                            "📞 Связаться".to_string(),
+                                            parsed_url
+                                        ));
+                                    },
+                                    Err(e) => {
+                                        println!("Error parsing URL for username {}: {}", username, e);
+                                    }
+                                }
+                            }
+                        }
+                        keyboard.push(booking_buttons);
                     }
 
                     // Add navigation buttons
@@ -1461,7 +1627,7 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
             },
             _ if data == "back_to_photographers" => {
                 if let Some(service_id) = session.service_id {
-                    show_photographers_for_service(bot.clone(), chat_id, &pool, service_id).await;
+                    show_photographers_for_service(bot.clone(), chat_id, &pool, service_id, msg.clone()).await;
                 }
             },
             _ if data == "back_to_calendar" => {
@@ -1590,21 +1756,23 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                                 format!("🔢 #{}", booking.id),
                                 "ignore".to_string()
                             ),
-                            InlineKeyboardButton::callback(
-                                "✅ Подтвердить".to_string(),
-                                format!("confirm_booking:{}", booking.id)
-                            ),
-                            InlineKeyboardButton::callback(
-                                "❌ Отменить".to_string(),
-                                format!("reject_booking:{}", booking.id)
-                            ),
                         ];
 
+                        // Добавляем кнопки в зависимости от статуса записи
+                        if booking.status == "new" {
+                            booking_buttons.push(InlineKeyboardButton::callback(
+                                "✅ Подтвердить".to_string(),
+                                format!("confirm_booking:{}", booking.id)
+                            ));
+                            booking_buttons.push(InlineKeyboardButton::callback(
+                                "❌ Отменить".to_string(),
+                                format!("reject_booking:{}", booking.id)
+                            ));
+                        }
+
                         if let Some(username) = &booking.client_phone {
-                            println!("Adding contact button for username: {}", username);
                             if !username.is_empty() {
                                 let url = format!("https://t.me/{}", username);
-                                println!("Generated URL: {}", url);
                                 match Url::parse(&url) {
                                     Ok(parsed_url) => {
                                         booking_buttons.push(InlineKeyboardButton::url(
@@ -1716,15 +1884,19 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                                 format!("🔢 #{}", booking.id),
                                 "ignore".to_string()
                             ),
-                            InlineKeyboardButton::callback(
+                        ];
+
+                        // Добавляем кнопки в зависимости от статуса записи
+                        if booking.status == "new" {
+                            booking_buttons.push(InlineKeyboardButton::callback(
                                 "✅ Подтвердить".to_string(),
                                 format!("confirm_booking:{}", booking.id)
-                            ),
-                            InlineKeyboardButton::callback(
+                            ));
+                            booking_buttons.push(InlineKeyboardButton::callback(
                                 "❌ Отменить".to_string(),
                                 format!("reject_booking:{}", booking.id)
-                            ),
-                        ];
+                            ));
+                        }
 
                         if let Some(username) = &booking.client_phone {
                             if !username.is_empty() {
@@ -1839,6 +2011,29 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                             booking.service_name,
                             status
                         ));
+                        let mut booking_buttons = vec![
+                            InlineKeyboardButton::callback(
+                                format!("🔢 #{}", booking.id),
+                                "ignore".to_string()
+                            ),
+                        ];
+                        if let Some(username) = &booking.client_phone {
+                            if !username.is_empty() {
+                                let url = format!("https://t.me/{}", username);
+                                match Url::parse(&url) {
+                                    Ok(parsed_url) => {
+                                        booking_buttons.push(InlineKeyboardButton::url(
+                                            "📞 Связаться".to_string(),
+                                            parsed_url
+                                        ));
+                                    },
+                                    Err(e) => {
+                                        println!("Error parsing URL for username {}: {}", username, e);
+                                    }
+                                }
+                            }
+                        }
+                        keyboard.push(booking_buttons);
                     }
 
                     let mut nav_buttons = vec![];
@@ -1908,6 +2103,38 @@ pub async fn handle_callback_query(q: CallbackQuery, bot: Bot, msg: Message, poo
                         }
                     },
                     _ => {}
+                }
+            },
+            _ if data.starts_with("complete_booking:") => {
+                let booking_id = data.split(':').nth(1).unwrap().parse::<i32>().unwrap();
+                
+                sqlx::query!(
+                    "UPDATE bookings SET status = 'выполнено' WHERE id = $1",
+                    booking_id
+                )
+                .execute(&pool)
+                .await?;
+
+                // Уведомляем клиента
+                if let Some(booking) = sqlx::query!(
+                    "SELECT client_id FROM bookings WHERE id = $1",
+                    booking_id
+                )
+                .fetch_optional(&pool)
+                .await? {
+                    if let Some(client) = sqlx::query!(
+                        "SELECT telegram_id FROM clients WHERE id = $1",
+                        booking.client_id
+                    )
+                    .fetch_optional(&pool)
+                    .await? {
+                        bot.send_message(ChatId(client.telegram_id), "Ваша запись была отмечена как завершенная! 🎉").await?;
+                    }
+                }
+
+                if let Some(msg) = q.message.clone() {
+                    let text = format!("✅ Запись №{} отмечена как завершенная",booking_id);
+                    bot.send_message(chat_id, text).await?;
                 }
             },
             _ => {}
@@ -2054,7 +2281,7 @@ async fn get_photographers_by_service(pool: &PgPool, service_id: i32) -> Vec<Pho
     .unwrap()
 }
 
-async fn show_photographers_for_service(bot: Bot, chat_id: ChatId, pool: &PgPool, service_id: i32) {
+async fn show_photographers_for_service(bot: Bot, chat_id: ChatId, pool: &PgPool, service_id: i32, msg: Message) {
     let photographers = get_photographers_by_service(pool, service_id).await;
 
     if photographers.is_empty() {
@@ -2077,7 +2304,12 @@ async fn show_photographers_for_service(bot: Bot, chat_id: ChatId, pool: &PgPool
         keyboard.push(vec![InlineKeyboardButton::callback(
             p.name.clone(),
             format!("photographer:{}", p.id)
-        )]);
+        ),
+        InlineKeyboardButton::callback(
+            "ℹ️ Подробнее".to_string(),
+            format!("photographer_info:{}", p.id)
+        ),
+        ]);
     }
     
     // Add back button
@@ -2088,10 +2320,10 @@ async fn show_photographers_for_service(bot: Bot, chat_id: ChatId, pool: &PgPool
 
     let keyboard = InlineKeyboardMarkup::new(keyboard);
 
-    bot.send_message(chat_id, "Выбери фотографа 📷\n\nИли выбери 'Любой фотограф' для автоматического назначения")
-        .reply_markup(ReplyMarkup::InlineKeyboard(keyboard))
-        .await
-        .unwrap();
+    bot.edit_message_text(chat_id, msg.id, "Выбери фотографа 📷\n\nИли выбери 'Любой фотограф' для автоматического назначения")
+                                    .parse_mode(teloxide::types::ParseMode::Markdown)
+                                    .reply_markup(keyboard)
+                                    .await;
 }
 
 pub fn generate_inline_markup(mark: &str, button: Vec<String>, action: Vec<String>) -> InlineKeyboardMarkup {
@@ -2133,29 +2365,36 @@ pub async fn generate_calendar(month: u32, year: i32, pool: &PgPool, photographe
 
         for day in 1..=num_days {
             let naive_date = NaiveDate::from_ymd_opt(year, month, day).unwrap();
+            let today = Local::now().date_naive();
             let date = Date::from_calendar_date(year, Month::try_from(month as u8).unwrap(), day as u8).unwrap();
-            let callback = format!("calendar:select:{}", naive_date);
-
-            // Проверяем, является ли день рабочим
-            let is_working_day = if photographer_id == -1 {
-                // Для "любого фотографа" проверяем наличие хотя бы одного фотографа с рабочими часами
-                check_any_photographer_available(pool, date).await
+            
+            if naive_date < today {
+                // Для дат в прошлом добавляем неактивную кнопку
+                row.push(InlineKeyboardButton::callback(
+                    format!("❌ {}", day),
+                    "ignore".to_string(),
+                ));
             } else {
-                if let Some((start_hour, end_hour)) = get_working_hours(pool, photographer_id, date).await {
-                    start_hour > 0 && end_hour > 0
+                // Проверяем, является ли день рабочим
+                let is_working_day = if photographer_id == -1 {
+                    // Для "любого фотографа" проверяем наличие хотя бы одного фотографа с рабочими часами
+                    check_any_photographer_available(pool, date).await
                 } else {
-                    false
-                }
-            };
+                    if let Some((start_hour, end_hour)) = get_working_hours(pool, photographer_id, date).await {
+                        start_hour > 0 && end_hour > 0
+                    } else {
+                        false
+                    }
+                };
 
-            // Форматируем текст кнопки в зависимости от статуса дня
-            let button_text = if is_working_day {
-                format!("{:2}", day) // Просто число для рабочих дней
-            } else {
-                format!("❌ {:2}", day) // Крестик для нерабочих дней
-            };
-
-            row.push(InlineKeyboardButton::callback(button_text, callback));
+                let callback = format!("calendar:select:{}", naive_date);
+                let button_text = if is_working_day {
+                    format!("{:2}", day) // Просто число для рабочих дней
+                } else {
+                    format!("❌ {:2}", day) // Крестик для нерабочих дней
+                };
+                row.push(InlineKeyboardButton::callback(button_text, callback));
+            }
 
             if row.len() == 7 {
                 keyboard.push(row.clone());
@@ -2316,8 +2555,10 @@ async fn create_booking(pool: &PgPool, client_id: i32, photographer_id: i32, ser
             println!("Sending notification to photographer with telegram_id: {}", telegram_id);
 
             // Отправляем уведомление фотографу, используя абсолютное значение telegram_id
-            if let Err(e) = bot.send_message(ChatId(telegram_id.abs() as i64), message).await {
-                error!("Failed to send notification to photographer: {}", e);
+            if let Err(e) = bot.send_message(ChatId(telegram_id.abs() as i64), message)
+                .parse_mode(teloxide::types::ParseMode::Markdown)
+                .await {
+                    error!("Failed to send notification to photographer: {}", e);
                 // Продолжаем выполнение, даже если не удалось отправить уведомление
             }
         }
@@ -2346,7 +2587,8 @@ async fn show_photographer_menu(bot: Bot, chat_id: ChatId) -> Result<(), Box<dyn
     let buttons: Vec<Vec<KeyboardButton>> = vec![
         vec![KeyboardButton::new("Моё расписание")],
         vec![KeyboardButton::new("Мои записи")],
-        vec![KeyboardButton::new("Загрузить материалы")],
+        vec![KeyboardButton::new("Изменить портфолио")],
+        vec![KeyboardButton::new("Изменить свое описание")],
     ];
 
     let keyboard = KeyboardMarkup::new(buttons).resize_keyboard();
@@ -2388,7 +2630,7 @@ async fn show_photographer_bookings(bot: Bot, chat_id: ChatId, pool: &PgPool, ph
     Ok(())
 }
 
-async fn show_time_slots(bot: Bot, chat_id: ChatId, slots: Vec<String>) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn show_time_slots(bot: Bot, chat_id: ChatId, slots: Vec<String>, message_id: MessageId) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut keyboard: Vec<Vec<InlineKeyboardButton>> = Vec::new();
     let mut current_row: Vec<InlineKeyboardButton> = Vec::new();
     
@@ -2400,22 +2642,20 @@ async fn show_time_slots(bot: Bot, chat_id: ChatId, slots: Vec<String>) -> Resul
         
         current_row.push(button);
         
-        // Создаем новую строку после каждых 2 слотов
         if current_row.len() == 2 || index == slots.len() - 1 {
             keyboard.push(current_row);
             current_row = Vec::new();
         }
     }
 
-    // Add back button
     keyboard.push(vec![InlineKeyboardButton::callback(
         "⟵ Назад к выбору даты".to_string(),
         "back_to_calendar".to_string()
     )]);
 
     let markup = InlineKeyboardMarkup::new(keyboard);
-    bot.send_message(chat_id, "Выберите удобное время:")
-        .reply_markup(ReplyMarkup::InlineKeyboard(markup))
+    bot.edit_message_text(chat_id, message_id, "Выберите удобное время:")
+        .reply_markup(markup)
         .await?;
 
     Ok(())
@@ -2470,7 +2710,9 @@ async fn notify_photographer(bot: &Bot, photographer_id: i32, pool: &PgPool, boo
     );
 
     if let Some(telegram_id) = photographer.telegram_id {
-        bot.send_message(ChatId(telegram_id as i64), message).await?;
+        bot.send_message(ChatId(telegram_id as i64), message)
+        .parse_mode(teloxide::types::ParseMode::Markdown)
+        .await?;
     }
 
     Ok(())
@@ -2537,7 +2779,7 @@ async fn get_working_hours(pool: &PgPool, photographer_id: i32, date: Date) -> O
     hours.map(|h| (h.start_hour, h.end_hour))
 }
 
-async fn show_client_bookings(bot: Bot, chat_id: ChatId, pool: &PgPool, client_id: i32) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn show_client_bookings(bot: Bot, chat_id: ChatId, pool: PgPool, client_id: i32, page: usize, session: &mut UserSession, msg: Message) -> Result<(), Box<dyn Error + Send + Sync>> {
     let bookings = sqlx::query!(
         r#"
         SELECT b.*, p.name as photographer_name, s.name as service_name
@@ -2547,9 +2789,9 @@ async fn show_client_bookings(bot: Bot, chat_id: ChatId, pool: &PgPool, client_i
         WHERE b.client_id = $1
         ORDER BY b.booking_start DESC
         "#,
-        client_id
+        session.client_id
     )
-    .fetch_all(pool)
+    .fetch_all(&pool)
     .await?;
 
     if bookings.is_empty() {
@@ -2560,9 +2802,8 @@ async fn show_client_bookings(bot: Bot, chat_id: ChatId, pool: &PgPool, client_i
 
     let bookings_per_page = 3;
     let total_pages = (bookings.len() + bookings_per_page - 1) / bookings_per_page;
-    let current_page = 0;
 
-    let start_idx = current_page * bookings_per_page;
+    let start_idx = page * bookings_per_page;
     let end_idx = std::cmp::min(start_idx + bookings_per_page, bookings.len());
     let page_bookings = &bookings[start_idx..end_idx];
 
@@ -2586,7 +2827,7 @@ async fn show_client_bookings(bot: Bot, chat_id: ChatId, pool: &PgPool, client_i
         };
         
         message.push_str(&format!(
-            "*Запись №{}*\n*Дата:* {}\n*Время:* {} - {}\n*Фотограф:* {}\n*Услуга:* {}\n*Статус:* {}\n\n",
+            "*Номер записи: {}*\n*Дата:* {}\n*Время:* {} - {}\n*Фотограф: *{}\n*Услуга:* {}\n*Статус:* {}\n\n",
             booking.id,
             date,
             start_time,
@@ -2595,30 +2836,44 @@ async fn show_client_bookings(bot: Bot, chat_id: ChatId, pool: &PgPool, client_i
             booking.service_name,
             status
         ));
+        if booking.status == "confirmed" || booking.status == "new" {
+            let mut booking_buttons = vec![
+                InlineKeyboardButton::callback(
+                    format!("🔢 #{}", booking.id),
+                    "ignore".to_string()
+                ),
+                ];
+
+                // Добавляем кнопки в зависимости от статуса записи
+                    booking_buttons.push(InlineKeyboardButton::callback(
+                        "❌ Отменить".to_string(),
+                        format!("client_reject_booking:{}", booking.id)
+                    ));
+                keyboard.push(booking_buttons);
+        }
     }
 
-    // Add navigation buttons if there are more than 3 bookings
-    if bookings.len() > bookings_per_page {
-        let mut nav_buttons = vec![];
-        if current_page > 0 {
-            nav_buttons.push(InlineKeyboardButton::callback("⬅️ Назад", format!("client_bookings:{}", current_page - 1)));
-        }
-        nav_buttons.push(InlineKeyboardButton::callback(
-            format!("📄 {}/{}", current_page + 1, total_pages),
-            "ignore".to_string(),
-        ));
-        if current_page < total_pages - 1 {
-            nav_buttons.push(InlineKeyboardButton::callback("Вперед ➡️", format!("client_bookings:{}", current_page + 1)));
-        }
-        keyboard.push(nav_buttons);
+    // Add navigation buttons
+    let mut nav_buttons = vec![];
+    if page > 0 {
+        nav_buttons.push(InlineKeyboardButton::callback("⬅️ Назад", format!("client_bookings:{}", page - 1)));
     }
+    nav_buttons.push(InlineKeyboardButton::callback(
+        format!("📄 {}/{}", page + 1, total_pages),
+        "ignore".to_string(),
+    ));
+    if page < total_pages - 1 {
+        nav_buttons.push(InlineKeyboardButton::callback("Вперед ➡️", format!("client_bookings:{}", page + 1)));
+    }
+    keyboard.push(nav_buttons);
 
     let keyboard = InlineKeyboardMarkup::new(keyboard);
-    bot.send_message(chat_id, message)
-        .parse_mode(teloxide::types::ParseMode::Markdown)
-        .reply_markup(ReplyMarkup::InlineKeyboard(keyboard))
-        .await?;
 
+    // Update the existing message
+    bot.edit_message_text(chat_id, msg.id, message)
+        .parse_mode(teloxide::types::ParseMode::Markdown)
+        .reply_markup(keyboard)
+        .await?;
     Ok(())
 }
 
@@ -2657,6 +2912,24 @@ fn month_name(month: u32) -> &'static str {
         1 => "Январь", 2 => "Февраль", 3 => "Март", 4 => "Апрель",
         5 => "Май", 6 => "Июнь", 7 => "Июль", 8 => "Август",
         9 => "Сентябрь", 10 => "Октябрь", 11 => "Ноябрь", 12 => "Декабрь",
+        _ => "",
+    }
+}
+
+fn month_name_from_month(month: Month) -> &'static str {
+    match month {
+        Month::January => "января", 
+        Month::February => "февраля", 
+        Month::March => "марта", 
+        Month::April => "апреля",
+        Month::May => "мая", 
+        Month::June => "июнь", 
+        Month::July => "июль", 
+        Month::August => "августа",
+        Month::September => "сентября", 
+        Month::October => "октября", 
+        Month::November => "ноября", 
+        Month::December => "декабря",
         _ => "",
     }
 }

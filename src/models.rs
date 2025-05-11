@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 pub struct Photographer {
     pub id: i32,
     pub name: String,
+    pub description: Option<String>,
+    pub portfolio_url: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
